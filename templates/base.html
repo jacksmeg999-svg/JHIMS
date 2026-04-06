@@ -342,6 +342,9 @@
       <a href="{{ url_for('dashboard') }}">🏠 Dashboard</a>
       {% if session.get('role') in ['Admin','Records'] %}<a href="{{ url_for('records') }}" style="background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;font-weight:700;border:none;">🏥 OPD Records</a>{% endif %}
       <a href="{{ url_for('cashier') }}">💰 Cashier</a>
+      <a href="{{ url_for('pharmacy') }}">💊 pharmacy</a>
+      <a href="{{ url_for('triage') }}">💉 triage</a>
+      <a href="{{ url_for('doctor') }}">🧑🏻‍⚕️ doctor</a>
       <a href="{{ url_for('lab') }}">🔬 Lab</a>
       <a href="{{ url_for('mortuary') }}">⚰️ Mortuary</a>
       <a href="{{ url_for('reports_home') }}">📊 Reports</a>

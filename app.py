@@ -306,6 +306,64 @@ CREATE TABLE IF NOT EXISTS ipd (
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO opd_settings (consultation_fee_non_insured, opd_prefix, patient_id_prefix) VALUES (10.0, 'OPD', 'JMH')")
 
+    # ── TRIAGE ──
+    c.execute("""CREATE TABLE IF NOT EXISTS triage_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        visit_id INTEGER, patient_id TEXT, patient_name TEXT, opd_number TEXT,
+        triage_date TEXT, triage_time TEXT, temperature REAL,
+        bp_systolic INTEGER, bp_diastolic INTEGER, pulse INTEGER,
+        respiration INTEGER, oxygen_sat REAL, weight REAL, height REAL, bmi REAL,
+        chief_complaint TEXT, triage_level TEXT DEFAULT 'Normal',
+        notes TEXT, triaged_by TEXT)""")
+
+    # ── DOCTOR ──
+    c.execute("""CREATE TABLE IF NOT EXISTS doctor_consultations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        visit_id INTEGER, patient_id TEXT, patient_name TEXT, opd_number TEXT,
+        consult_date TEXT, doctor_name TEXT, chief_complaint TEXT,
+        history TEXT, examination TEXT, diagnosis TEXT, treatment_plan TEXT,
+        notes TEXT, status TEXT DEFAULT 'Open', follow_up_date TEXT)""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS doctor_lab_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        consultation_id INTEGER, patient_id TEXT, patient_name TEXT,
+        tests_json TEXT, requested_by TEXT, requested_at TEXT,
+        status TEXT DEFAULT 'Pending')""")
+
+    # ── PRESCRIPTIONS ──
+    c.execute("""CREATE TABLE IF NOT EXISTS prescriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        consultation_id INTEGER, patient_id TEXT, patient_name TEXT,
+        opd_number TEXT, prescribed_by TEXT, prescribed_at TEXT,
+        drugs_json TEXT, total_amount REAL DEFAULT 0.0,
+        invoice_no TEXT, status TEXT DEFAULT 'Pending',
+        is_paid INTEGER DEFAULT 0, is_dispensed INTEGER DEFAULT 0, notes TEXT)""")
+
+    # ── PHARMACY ──
+    c.execute("""CREATE TABLE IF NOT EXISTS pharmacy_drugs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        drug_name TEXT UNIQUE, generic_name TEXT, category TEXT,
+        unit TEXT DEFAULT 'Tablet', unit_price REAL DEFAULT 0.0,
+        stock_qty INTEGER DEFAULT 0, reorder_level INTEGER DEFAULT 10,
+        supplier TEXT, expiry_date TEXT, is_active INTEGER DEFAULT 1)""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS pharmacy_dispensing (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prescription_id INTEGER, patient_id TEXT, patient_name TEXT,
+        dispensed_by TEXT, dispensed_at TEXT, drugs_json TEXT,
+        total_amount REAL DEFAULT 0.0, invoice_no TEXT,
+        is_paid INTEGER DEFAULT 0, receipt_no TEXT)""")
+
+    # ── UNIVERSAL INVOICES ──
+    c.execute("""CREATE TABLE IF NOT EXISTS invoices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_no TEXT UNIQUE, invoice_type TEXT,
+        patient_id TEXT, patient_name TEXT, opd_number TEXT,
+        items_json TEXT, total_amount REAL DEFAULT 0.0,
+        created_at TEXT, created_by TEXT,
+        is_paid INTEGER DEFAULT 0, paid_at TEXT,
+        receipt_no TEXT, notes TEXT)""")
+
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
         default_users = [
@@ -315,11 +373,11 @@ CREATE TABLE IF NOT EXISTS ipd (
             ("mortuary", generate_password_hash("mortuary123"), "Mortuary"),
             ("reports",  generate_password_hash("reports123"),  "Reports"),
             ("records",  generate_password_hash("records123"),  "Records"),
+            ("triage",   generate_password_hash("triage123"),   "Triage"),
+            ("doctor",   generate_password_hash("doctor123"),   "Doctor"),
+            ("pharmacy", generate_password_hash("pharmacy123"), "Pharmacy"),
         ]
-        c.executemany(
-            "INSERT INTO users(username,password,role) VALUES(?,?,?)",
-            default_users,
-        )
+        c.executemany("INSERT INTO users(username,password,role) VALUES(?,?,?)", default_users,)
 
     c.execute("SELECT COUNT(*) FROM lab_test_prices")
     if c.fetchone()[0] == 0:
@@ -494,6 +552,23 @@ def generate_lab_invoice():
     inv = f"{prefix}{new}"
     set_meta("lab_inv_last", inv)
     return inv
+
+
+def generate_invoice_no(prefix="INV"):
+    key = f"inv_{prefix}_last"
+    last = get_meta(key, f"{prefix}000000") or f"{prefix}000000"
+    num = last.replace(prefix, "")
+    try:
+        seq = int(num) + 1
+        width = max(len(num), 6)
+    except Exception:
+        seq = 1; width = 6
+    inv = f"{prefix}{seq:0{width}d}"
+    set_meta(key, inv)
+    return inv
+
+def generate_rx_no():   return generate_invoice_no("RX")
+def generate_pharm_inv(): return generate_invoice_no("PH")
 
 
 
@@ -2554,6 +2629,617 @@ def api_patient_name():
                 "age": row["age"], "sex": row["sex"], "nhis": row["nhis_number"],
                 "funding": row["funding"]}
     return {"name": None}
+
+
+
+# ============================================================
+#  UNIVERSAL LOOKUP API
+# ============================================================
+
+@app.route("/api/lookup")
+def api_lookup():
+    q = request.args.get("q","").strip()
+    if not q:
+        return {"found": False}
+    conn = get_db(); c = conn.cursor()
+    result = {"found": False}
+    c.execute("SELECT * FROM opd_patients WHERE patient_id=? OR opd_number=?", (q,q))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return {"found":True,"patient_id":row["patient_id"],"name":row["full_name"],
+                "opd_number":row["opd_number"],"funding":row["funding"],
+                "age":row["age"] or "","sex":row["sex"] or "","nhis":row["nhis_number"] or ""}
+    c.execute("SELECT * FROM mortuary_cases WHERE corpse_id=?", (q,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return {"found":True,"patient_id":row["corpse_id"],"name":row["corpse_name"],"opd_number":"","funding":"Mortuary","type":"mortuary"}
+    c.execute("SELECT * FROM invoices WHERE invoice_no=?", (q,))
+    row = c.fetchone()
+    if row:
+        r = dict(row); conn.close()
+        return {"found":True,"patient_id":r["patient_id"],"name":r["patient_name"],"opd_number":r.get("opd_number","") or "","funding":"","invoice_no":r["invoice_no"],"total":r["total_amount"]}
+    conn.close()
+    return {"found":False}
+
+
+@app.route("/api/pending-invoices")
+@login_required(role="Cashier")
+def api_pending_invoices():
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM invoices WHERE is_paid=0 ORDER BY id DESC LIMIT 50")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return {"invoices": rows, "count": len(rows)}
+
+
+# ============================================================
+#  TRIAGE MODULE
+# ============================================================
+
+@app.route("/triage")
+@login_required(role="Triage")
+def triage():
+    conn = get_db(); c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("""SELECT v.*, p.full_name, p.age, p.sex, p.funding
+        FROM opd_visits v JOIN opd_patients p ON v.patient_id=p.patient_id
+        WHERE v.visit_date=? AND v.triage_status='Pending' ORDER BY v.id ASC""", (today,))
+    pending = c.fetchall()
+    c.execute("SELECT * FROM triage_records WHERE triage_date=? ORDER BY id DESC", (today,))
+    done = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM triage_records WHERE triage_date=?", (today,))
+    today_count = c.fetchone()[0]
+    conn.close()
+    return render_template("triage.html", pending=pending, done=done, today=today, today_count=today_count)
+
+
+@app.route("/triage/record/<int:visit_id>", methods=["GET","POST"])
+@login_required(role="Triage")
+def triage_record(visit_id):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM opd_visits WHERE id=?", (visit_id,))
+    visit = c.fetchone()
+    if not visit:
+        conn.close(); flash("Visit not found.","danger"); return redirect(url_for("triage"))
+    c.execute("SELECT * FROM opd_patients WHERE patient_id=?", (visit["patient_id"],))
+    patient = c.fetchone()
+    if request.method == "POST":
+        temp=request.form.get("temperature",""); bp_s=request.form.get("bp_systolic","")
+        bp_d=request.form.get("bp_diastolic",""); pulse=request.form.get("pulse","")
+        resp=request.form.get("respiration",""); o2=request.form.get("oxygen_sat","")
+        weight=request.form.get("weight",""); height=request.form.get("height","")
+        complaint=request.form.get("chief_complaint","").strip()
+        level=request.form.get("triage_level","Normal"); notes=request.form.get("notes","").strip()
+        today=datetime.now().strftime("%Y-%m-%d"); ttime=datetime.now().strftime("%H:%M")
+        bmi=None
+        try:
+            w=float(weight); h=float(height)/100
+            if h>0: bmi=round(w/(h*h),1)
+        except: pass
+        c.execute("""INSERT INTO triage_records
+            (visit_id,patient_id,patient_name,opd_number,triage_date,triage_time,
+             temperature,bp_systolic,bp_diastolic,pulse,respiration,oxygen_sat,
+             weight,height,bmi,chief_complaint,triage_level,notes,triaged_by)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (visit_id,visit["patient_id"],patient["full_name"] if patient else "",
+             visit["opd_number"],today,ttime,
+             temp or None,bp_s or None,bp_d or None,pulse or None,
+             resp or None,o2 or None,weight or None,height or None,bmi,
+             complaint,level,notes,session.get("user")))
+        c.execute("UPDATE opd_visits SET triage_status='Done', current_location='Doctor', doctor_status='Pending' WHERE id=?", (visit_id,))
+        conn.commit(); conn.close()
+        log_activity(session.get("user"),"TRIAGE",f"Triaged {patient['full_name'] if patient else visit_id}")
+        flash("Vitals saved. Patient sent to Doctor.","success")
+        return redirect(url_for("triage"))
+    conn.close()
+    return render_template("triage_record.html", visit=visit, patient=patient)
+
+
+# ============================================================
+#  DOCTOR MODULE
+# ============================================================
+
+@app.route("/doctor")
+@login_required(role="Doctor")
+def doctor():
+    conn = get_db(); c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("""SELECT v.*, p.full_name, p.age, p.sex, p.funding, p.nhis_number
+        FROM opd_visits v JOIN opd_patients p ON v.patient_id=p.patient_id
+        WHERE v.visit_date=? AND v.doctor_status='Pending' ORDER BY v.id ASC""", (today,))
+    waiting = c.fetchall()
+    c.execute("SELECT * FROM doctor_consultations WHERE consult_date=? ORDER BY id DESC", (today,))
+    consultations = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM doctor_consultations WHERE consult_date=?", (today,))
+    today_count = c.fetchone()[0]
+    conn.close()
+    return render_template("doctor.html", waiting=waiting, consultations=consultations, today=today, today_count=today_count)
+
+
+@app.route("/doctor/consult/<int:visit_id>", methods=["GET","POST"])
+@login_required(role="Doctor")
+def doctor_consult(visit_id):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM opd_visits WHERE id=?", (visit_id,))
+    visit = c.fetchone()
+    if not visit:
+        conn.close(); flash("Visit not found.","danger"); return redirect(url_for("doctor"))
+    c.execute("SELECT * FROM opd_patients WHERE patient_id=?", (visit["patient_id"],))
+    patient = c.fetchone()
+    c.execute("SELECT * FROM triage_records WHERE visit_id=? ORDER BY id DESC LIMIT 1", (visit_id,))
+    vitals = c.fetchone()
+    c.execute("SELECT * FROM doctor_consultations WHERE patient_id=? ORDER BY id DESC LIMIT 5", (visit["patient_id"],))
+    prev_consults = c.fetchall()
+    c.execute("SELECT * FROM lab_test_prices ORDER BY name")
+    lab_tests = c.fetchall()
+    c.execute("SELECT * FROM pharmacy_drugs WHERE is_active=1 ORDER BY drug_name")
+    drugs_list = c.fetchall()
+    if request.method == "POST":
+        action=request.form.get("action","save")
+        complaint=request.form.get("chief_complaint","").strip()
+        history=request.form.get("history","").strip()
+        examination=request.form.get("examination","").strip()
+        diagnosis=request.form.get("diagnosis","").strip()
+        treatment=request.form.get("treatment_plan","").strip()
+        notes=request.form.get("notes","").strip()
+        follow_up=request.form.get("follow_up_date","").strip()
+        today_str=datetime.now().strftime("%Y-%m-%d")
+        now_str=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("""INSERT INTO doctor_consultations
+            (visit_id,patient_id,patient_name,opd_number,consult_date,doctor_name,
+             chief_complaint,history,examination,diagnosis,treatment_plan,notes,status,follow_up_date)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'Open',?)""",
+            (visit_id,visit["patient_id"],patient["full_name"] if patient else "",
+             visit["opd_number"],today_str,session.get("user"),
+             complaint,history,examination,diagnosis,treatment,notes,follow_up or None))
+        consult_id = c.lastrowid
+        if action == "send_lab":
+            tests_json=request.form.get("tests_json","[]")
+            if tests_json and tests_json != "[]":
+                c.execute("""INSERT INTO doctor_lab_requests
+                    (consultation_id,patient_id,patient_name,tests_json,requested_by,requested_at,status)
+                    VALUES(?,?,?,?,?,?,'Pending')""",
+                    (consult_id,visit["patient_id"],patient["full_name"] if patient else "",
+                     tests_json,session.get("user"),now_str))
+                c.execute("UPDATE opd_visits SET lab_status='Pending', current_location='Lab' WHERE id=?", (visit_id,))
+                flash("Lab request sent to Lab module.","info")
+        if action == "prescribe":
+            drugs_json=request.form.get("drugs_json","[]")
+            if drugs_json and drugs_json != "[]":
+                rx_no=generate_rx_no()
+                try: drugs=json.loads(drugs_json); total=sum(float(d.get("total",0)) for d in drugs)
+                except: total=0.0
+                c.execute("""INSERT INTO prescriptions
+                    (consultation_id,patient_id,patient_name,opd_number,prescribed_by,
+                     prescribed_at,drugs_json,total_amount,invoice_no,status)
+                    VALUES(?,?,?,?,?,?,?,?,?,'Pending')""",
+                    (consult_id,visit["patient_id"],patient["full_name"] if patient else "",
+                     visit["opd_number"],session.get("user"),now_str,drugs_json,total,rx_no))
+                ph_inv=generate_invoice_no("PH")
+                c.execute("""INSERT OR IGNORE INTO invoices
+                    (invoice_no,invoice_type,patient_id,patient_name,opd_number,
+                     items_json,total_amount,created_at,created_by)
+                    VALUES(?,'Pharmacy',?,?,?,?,?,?,?)""",
+                    (ph_inv,visit["patient_id"],patient["full_name"] if patient else "",
+                     visit["opd_number"],drugs_json,total,now_str,session.get("user")))
+                c.execute("UPDATE opd_visits SET pharmacy_status='Pending', current_location='Pharmacy' WHERE id=?", (visit_id,))
+                flash(f"Prescription sent to Pharmacy. RX: {rx_no}","success")
+        c.execute("UPDATE opd_visits SET doctor_status='Done' WHERE id=?", (visit_id,))
+        conn.commit(); conn.close()
+        log_activity(session.get("user"),"DOCTOR_CONSULT",f"Consulted {patient['full_name'] if patient else visit_id}")
+        flash("Consultation saved.","success")
+        return redirect(url_for("doctor"))
+    conn.close()
+    return render_template("doctor_consult.html", visit=visit, patient=patient, vitals=vitals,
+                           prev_consults=prev_consults, lab_tests=lab_tests, drugs_list=drugs_list)
+
+
+@app.route("/doctor/consultation/<int:cid>")
+@login_required(role="Doctor")
+def doctor_view_consult(cid):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM doctor_consultations WHERE id=?", (cid,))
+    consult = c.fetchone()
+    if not consult:
+        conn.close(); flash("Not found.","danger"); return redirect(url_for("doctor"))
+    c.execute("SELECT * FROM opd_patients WHERE patient_id=?", (consult["patient_id"],))
+    patient = c.fetchone()
+    c.execute("SELECT * FROM triage_records WHERE visit_id=? ORDER BY id DESC LIMIT 1", (consult["visit_id"],))
+    vitals = c.fetchone()
+    c.execute("SELECT * FROM doctor_lab_requests WHERE consultation_id=?", (cid,))
+    lab_reqs = c.fetchall()
+    c.execute("SELECT * FROM lab_requests WHERE patient_id=? ORDER BY id DESC LIMIT 5", (consult["patient_id"],))
+    lab_results_list = c.fetchall()
+    c.execute("SELECT * FROM prescriptions WHERE consultation_id=?", (cid,))
+    prescriptions = c.fetchall()
+    conn.close()
+    return render_template("doctor_view_consult.html", consult=consult, patient=patient,
+                           vitals=vitals, lab_reqs=lab_reqs, lab_results_list=lab_results_list,
+                           prescriptions=prescriptions)
+
+
+# ============================================================
+#  UPGRADED CASHIER
+# ============================================================
+
+@app.route("/cashier/invoice/new", methods=["GET","POST"])
+@login_required(role="Cashier")
+def cashier_new_invoice():
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM services ORDER BY name")
+    services = c.fetchall()
+    if request.method == "POST":
+        patient_id=request.form.get("patient_id","").strip()
+        patient_name=request.form.get("patient_name","").strip()
+        opd_number=request.form.get("opd_number","").strip()
+        items_json=request.form.get("items_json","[]")
+        notes=request.form.get("notes","").strip()
+        try: items=json.loads(items_json); total=sum(float(i.get("amount",0)) for i in items)
+        except: items=[]; total=0.0
+        inv_no=generate_invoice_no("MAN")
+        c.execute("""INSERT INTO invoices
+            (invoice_no,invoice_type,patient_id,patient_name,opd_number,
+             items_json,total_amount,created_at,created_by,notes)
+            VALUES(?,'Manual',?,?,?,?,?,?,?,?)""",
+            (inv_no,patient_id,patient_name,opd_number,json.dumps(items),
+             total,datetime.now().strftime("%Y-%m-%d %H:%M:%S"),session.get("user"),notes))
+        conn.commit(); conn.close()
+        flash(f"Invoice created: {inv_no}","success")
+        return redirect(url_for("cashier_invoice_view", inv_no=inv_no))
+    conn.close()
+    return render_template("cashier_invoice_new.html", services=services)
+
+
+@app.route("/cashier/invoice/<inv_no>")
+@login_required(role="Cashier")
+def cashier_invoice_view(inv_no):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM invoices WHERE invoice_no=?", (inv_no,))
+    invoice = c.fetchone()
+    conn.close()
+    if not invoice:
+        flash("Invoice not found.","danger"); return redirect(url_for("cashier"))
+    try: items=json.loads(invoice["items_json"] or "[]")
+    except: items=[]
+    return render_template("cashier_invoice_view.html", invoice=invoice, items=items)
+
+
+@app.route("/cashier/invoice/<inv_no>/pay", methods=["POST"])
+@login_required(role="Cashier")
+def cashier_pay_invoice(inv_no):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM invoices WHERE invoice_no=?", (inv_no,))
+    invoice = c.fetchone()
+    if not invoice:
+        conn.close(); flash("Invoice not found.","danger"); return redirect(url_for("cashier"))
+    payment_method=request.form.get("payment_method","Cash")
+    receipt=generate_receipt_number()
+    now_str=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today=datetime.now().strftime("%Y-%m-%d")
+    c.execute("UPDATE invoices SET is_paid=1, paid_at=?, receipt_no=? WHERE invoice_no=?", (now_str,receipt,inv_no))
+    amount_words=amount_to_words(invoice["total_amount"])
+    c.execute("""INSERT INTO patient_records
+        (date,receipt_number,patient_id,patient_name,service_received,
+         amount_paid,amount_in_words,cashier_name,payment_method,details)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (today,receipt,invoice["patient_id"],invoice["patient_name"],
+         invoice["invoice_type"],invoice["total_amount"],amount_words,
+         session.get("user"),payment_method,f"Invoice {inv_no}"))
+    rec_id=c.lastrowid
+    itype=invoice["invoice_type"]
+    if itype in ("Pharmacy","PH"):
+        c.execute("UPDATE prescriptions SET is_paid=1 WHERE invoice_no=?", (inv_no,))
+    if itype in ("Lab","INV"):
+        c.execute("UPDATE lab_requests SET is_paid=1 WHERE invoice_no=?", (inv_no,))
+    if itype == "Mortuary":
+        c.execute("UPDATE mortuary_cases SET embalming_paid=1 WHERE corpse_id=?", (invoice["patient_id"],))
+    conn.commit(); conn.close()
+    log_activity(session.get("user"),"PAYMENT",f"Paid invoice {inv_no} receipt {receipt}")
+    flash(f"Payment recorded. Receipt: {receipt}","success")
+    return redirect(url_for("receipt_view", rec_id=rec_id))
+
+
+@app.route("/cashier/pending-invoices")
+@login_required(role="Cashier")
+def cashier_pending_invoices():
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM invoices WHERE is_paid=0 ORDER BY id DESC")
+    invoices = c.fetchall()
+    conn.close()
+    return render_template("cashier_pending.html", invoices=invoices)
+
+
+# ============================================================
+#  UPGRADED LAB MODULE
+# ============================================================
+
+@app.route("/lab/requests")
+@login_required(role="Lab")
+def lab_requests_list():
+    conn = get_db(); c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT * FROM doctor_lab_requests WHERE status='Pending' ORDER BY id DESC")
+    doctor_requests = c.fetchall()
+    c.execute("SELECT * FROM lab_requests WHERE substr(created_at,1,10)=? ORDER BY id DESC", (today,))
+    today_labs = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM lab_requests WHERE substr(created_at,1,10)=?", (today,))
+    today_count = c.fetchone()[0]
+    c.execute("SELECT COALESCE(SUM(total_amount),0) FROM lab_requests WHERE substr(created_at,1,10)=?", (today,))
+    today_total = c.fetchone()[0]
+    conn.close()
+    return render_template("lab_requests.html", doctor_requests=doctor_requests,
+        today_labs=today_labs, today_count=today_count, today_total=today_total, today=today)
+
+
+@app.route("/lab/doctor-request/<int:req_id>", methods=["GET","POST"])
+@login_required(role="Lab")
+def lab_process_doctor_request(req_id):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM doctor_lab_requests WHERE id=?", (req_id,))
+    dr_req = c.fetchone()
+    if not dr_req:
+        conn.close(); flash("Request not found.","danger"); return redirect(url_for("lab_requests_list"))
+    c.execute("SELECT * FROM opd_patients WHERE patient_id=?", (dr_req["patient_id"],))
+    patient = c.fetchone()
+    c.execute("SELECT * FROM lab_test_prices ORDER BY name")
+    all_tests = c.fetchall()
+    if request.method == "POST":
+        insured_status=request.form.get("insured_status","Non-insured")
+        tests_json=request.form.get("tests_json","[]")
+        try: total=float(request.form.get("total_amount","0"))
+        except: total=0.0
+        invoice=generate_lab_invoice()
+        created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("""INSERT INTO lab_requests
+            (created_at,patient_id,patient_name,age,insured_status,
+             tests_json,total_amount,invoice_no,is_paid,results_json,results_at)
+            VALUES(?,?,?,?,?,?,?,?,0,NULL,NULL)""",
+            (created_at,dr_req["patient_id"],dr_req["patient_name"],
+             patient["age"] if patient else "",insured_status,tests_json,total,invoice))
+        lab_id=c.lastrowid
+        inv_no=generate_invoice_no("LAB")
+        c.execute("""INSERT OR IGNORE INTO invoices
+            (invoice_no,invoice_type,patient_id,patient_name,opd_number,
+             items_json,total_amount,created_at,created_by)
+            VALUES(?,'Lab',?,?,?,?,?,?,?)""",
+            (inv_no,dr_req["patient_id"],dr_req["patient_name"],
+             patient["opd_number"] if patient else "",
+             tests_json,total,created_at,session.get("user")))
+        c.execute("UPDATE doctor_lab_requests SET status='Processing' WHERE id=?", (req_id,))
+        conn.commit(); conn.close()
+        log_activity(session.get("user"),"LAB_INVOICE",f"Invoice {invoice} for {dr_req['patient_name']}")
+        flash(f"Lab invoice {invoice} created. Send patient to Cashier.","success")
+        return redirect(url_for("lab_invoice", req_id=lab_id))
+    conn.close()
+    return render_template("lab_process_request.html", dr_req=dr_req, patient=patient, all_tests=all_tests)
+
+
+@app.route("/lab/result/<int:req_id>/notify")
+@login_required(role="Lab")
+def lab_result_notify(req_id):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM lab_requests WHERE id=?", (req_id,))
+    req = c.fetchone()
+    if req:
+        c.execute("UPDATE opd_visits SET lab_status='Done' WHERE patient_id=? AND lab_status='Pending'", (req["patient_id"],))
+        conn.commit()
+        log_activity(session.get("user"),"LAB_RESULT_READY",f"Results ready {req['patient_name']}")
+        flash("Results marked ready. Doctor notified.","success")
+    conn.close()
+    return redirect(url_for("lab_results", req_id=req_id))
+
+
+# ============================================================
+#  PHARMACY MODULE
+# ============================================================
+
+@app.route("/pharmacy")
+@login_required(role="Pharmacy")
+def pharmacy():
+    conn = get_db(); c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT * FROM prescriptions WHERE status='Pending' ORDER BY id DESC")
+    pending_rx = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM pharmacy_dispensing WHERE substr(dispensed_at,1,10)=?", (today,))
+    today_dispensed = c.fetchone()[0]
+    c.execute("SELECT COALESCE(SUM(total_amount),0) FROM pharmacy_dispensing WHERE substr(dispensed_at,1,10)=? AND is_paid=1", (today,))
+    today_revenue = c.fetchone()[0]
+    c.execute("SELECT * FROM pharmacy_drugs WHERE stock_qty <= reorder_level AND is_active=1 ORDER BY stock_qty ASC LIMIT 8")
+    low_stock = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM pharmacy_drugs WHERE is_active=1")
+    total_drugs = c.fetchone()[0]
+    conn.close()
+    return render_template("pharmacy.html", pending_rx=pending_rx,
+        today_dispensed=today_dispensed, today_revenue=today_revenue,
+        low_stock=low_stock, total_drugs=total_drugs, today=today)
+
+@app.route('/pharmacy/drug/edit/<int:did>', methods=['GET', 'POST'])
+def pharmacy_drug_edit(did):
+    conn = sqlite3.connect('hospital.db')
+    c = conn.cursor()
+
+    if request.method == 'POST':
+        drug_name = request.form['drug_name']
+        generic_name = request.form['generic_name']
+        category = request.form['category']
+        unit = request.form['unit']
+        unit_price = request.form['unit_price']
+        stock_qty = request.form['stock_qty']
+        reorder_level = request.form['reorder_level']
+
+        c.execute("""
+            UPDATE drugs SET
+            drug_name=?, generic_name=?, category=?, unit=?,
+            unit_price=?, stock_qty=?, reorder_level=?
+            WHERE id=?
+        """, (drug_name, generic_name, category, unit,
+              unit_price, stock_qty, reorder_level, did))
+
+        conn.commit()
+        conn.close()
+
+        flash("Drug updated successfully", "success")
+        return redirect(url_for('pharmacy'))
+
+    c.execute("SELECT * FROM drugs WHERE id=?", (did,))
+    drug = c.fetchone()
+    conn.close()
+
+    return render_template("edit_drug.html", drug=drug)
+
+
+@app.route("/pharmacy/dispense/<int:rx_id>", methods=["GET","POST"])
+@login_required(role="Pharmacy")
+def pharmacy_dispense(rx_id):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM prescriptions WHERE id=?", (rx_id,))
+    rx = c.fetchone()
+    if not rx:
+        conn.close(); flash("Prescription not found.","danger"); return redirect(url_for("pharmacy"))
+    if request.method == "POST":
+        if not rx["is_paid"]:
+            conn.close(); flash("Cannot dispense. Patient has not paid.","danger")
+            return redirect(url_for("pharmacy_dispense", rx_id=rx_id))
+        now_str=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        inv_no=generate_pharm_inv()
+        c.execute("""INSERT INTO pharmacy_dispensing
+            (prescription_id,patient_id,patient_name,dispensed_by,dispensed_at,
+             drugs_json,total_amount,invoice_no,is_paid)
+            VALUES(?,?,?,?,?,?,?,?,1)""",
+            (rx_id,rx["patient_id"],rx["patient_name"],session.get("user"),now_str,
+             rx["drugs_json"],rx["total_amount"],inv_no))
+        try:
+            drugs=json.loads(rx["drugs_json"] or "[]")
+            for d in drugs:
+                c.execute("UPDATE pharmacy_drugs SET stock_qty=stock_qty-? WHERE drug_name=? AND stock_qty>0",
+                          (int(d.get("qty",1)),d.get("name","")))
+        except: pass
+        c.execute("UPDATE prescriptions SET status='Dispensed', is_dispensed=1 WHERE id=?", (rx_id,))
+        conn.commit(); conn.close()
+        log_activity(session.get("user"),"PHARMACY_DISPENSE",f"Dispensed to {rx['patient_name']}")
+        flash("Drugs dispensed successfully!","success")
+        return redirect(url_for("pharmacy"))
+    try: drugs=json.loads(rx["drugs_json"] or "[]")
+    except: drugs=[]
+    conn.close()
+    return render_template("pharmacy_dispense.html", rx=rx, drugs=drugs)
+
+
+@app.route("/pharmacy/drugs")
+@login_required(role="Pharmacy")
+def pharmacy_drugs():
+    conn = get_db(); c = conn.cursor()
+    q=request.args.get("q","").strip(); cat=request.args.get("cat","").strip()
+    if q:
+        c.execute("SELECT * FROM pharmacy_drugs WHERE (drug_name LIKE ? OR generic_name LIKE ?) AND is_active=1 ORDER BY drug_name", (f"%{q}%",f"%{q}%"))
+    elif cat:
+        c.execute("SELECT * FROM pharmacy_drugs WHERE category=? AND is_active=1 ORDER BY drug_name", (cat,))
+    else:
+        c.execute("SELECT * FROM pharmacy_drugs WHERE is_active=1 ORDER BY drug_name")
+    drugs = c.fetchall()
+    c.execute("SELECT DISTINCT category FROM pharmacy_drugs WHERE is_active=1 AND category!='' ORDER BY category")
+    categories = [r["category"] for r in c.fetchall()]
+    conn.close()
+    return render_template("pharmacy_drugs.html", drugs=drugs, q=q, cat=cat, categories=categories)
+
+
+@app.route("/pharmacy/drug/add", methods=["GET","POST"])
+@login_required(role="Pharmacy")
+def pharmacy_drug_add():
+    drug = None
+    if request.method == "POST":
+        conn = get_db(); c = conn.cursor()
+        did = request.form.get("drug_id","")
+        if did:
+            c.execute("""UPDATE pharmacy_drugs SET drug_name=?,generic_name=?,category=?,unit=?,
+                unit_price=?,stock_qty=?,reorder_level=?,supplier=?,expiry_date=? WHERE id=?""",
+                (request.form.get("drug_name","").strip(), request.form.get("generic_name","").strip(),
+                 request.form.get("category","").strip(), request.form.get("unit","Tablet"),
+                 float(request.form.get("unit_price",0) or 0), int(request.form.get("stock_qty",0) or 0),
+                 int(request.form.get("reorder_level",10) or 10), request.form.get("supplier","").strip(),
+                 request.form.get("expiry_date","").strip(), did))
+        else:
+            c.execute("""INSERT OR IGNORE INTO pharmacy_drugs
+                (drug_name,generic_name,category,unit,unit_price,stock_qty,reorder_level,supplier,expiry_date)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (request.form.get("drug_name","").strip(), request.form.get("generic_name","").strip(),
+                 request.form.get("category","").strip(), request.form.get("unit","Tablet"),
+                 float(request.form.get("unit_price",0) or 0), int(request.form.get("stock_qty",0) or 0),
+                 int(request.form.get("reorder_level",10) or 10), request.form.get("supplier","").strip(),
+                 request.form.get("expiry_date","").strip()))
+        conn.commit(); conn.close()
+        flash("Drug saved.","success")
+        return redirect(url_for("pharmacy_drugs"))
+    did = request.args.get("id","")
+    if did:
+        conn = get_db(); c = conn.cursor()
+        c.execute("SELECT * FROM pharmacy_drugs WHERE id=?", (did,))
+        drug = c.fetchone(); conn.close()
+    return render_template("pharmacy_drug_add.html", drug=drug)
+
+
+@app.route("/pharmacy/upload-drugs", methods=["GET","POST"])
+@login_required(role="Pharmacy")
+def pharmacy_upload_drugs():
+    if request.method == "POST":
+        f = request.files.get("drug_file")
+        if not f or not (f.filename.endswith(".xlsx") or f.filename.endswith(".xls") or f.filename.endswith(".csv")):
+            flash("Upload an Excel (.xlsx/.xls) or CSV file.","danger")
+            return redirect(url_for("pharmacy_upload_drugs"))
+        import tempfile, os as _os
+        suffix = _os.path.splitext(f.filename)[1]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        f.save(tmp.name); tmp.close()
+        try:
+            if suffix == ".csv":
+                import csv
+                with open(tmp.name, newline='', encoding='utf-8-sig') as cf:
+                    rows = list(csv.DictReader(cf))
+            else:
+                import openpyxl
+                wb = openpyxl.load_workbook(tmp.name, data_only=True)
+                ws = wb.active
+                headers = [str(c2.value or "").strip().lower() for c2 in ws[1]]
+                rows = [{headers[i]: (row[i] or "") for i in range(len(headers))} for row in ws.iter_rows(min_row=2, values_only=True)]
+            conn = get_db(); c = conn.cursor()
+            added = 0
+            for row in rows:
+                name=str(row.get("drug_name","") or row.get("name","") or row.get("drug","")).strip()
+                if not name: continue
+                try:
+                    c.execute("""INSERT OR IGNORE INTO pharmacy_drugs
+                        (drug_name,generic_name,category,unit,unit_price,stock_qty,reorder_level)
+                        VALUES(?,?,?,?,?,?,?)""",
+                        (name, str(row.get("generic_name","") or "").strip(),
+                         str(row.get("category","") or "").strip(),
+                         str(row.get("unit","") or "Tablet").strip(),
+                         float(row.get("unit_price",0) or row.get("price",0) or 0),
+                         int(float(row.get("stock_qty",0) or row.get("quantity",0) or row.get("qty",0) or 0)),
+                         int(float(row.get("reorder_level",10) or 10))))
+                    added += 1
+                except: pass
+            conn.commit(); conn.close(); _os.unlink(tmp.name)
+            flash(f"✅ {added} drugs imported successfully!","success")
+        except Exception as e:
+            flash(f"Error: {e}","danger")
+        return redirect(url_for("pharmacy_drugs"))
+    return render_template("pharmacy_upload.html")
+
+
+@app.route("/pharmacy/invoice/<int:rx_id>")
+@login_required(role="Pharmacy")
+def pharmacy_invoice(rx_id):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM prescriptions WHERE id=?", (rx_id,))
+    rx = c.fetchone()
+    if not rx:
+        conn.close(); flash("Not found.","danger"); return redirect(url_for("pharmacy"))
+    try: drugs=json.loads(rx["drugs_json"] or "[]")
+    except: drugs=[]
+    conn.close()
+    return render_template("pharmacy_invoice.html", rx=rx, drugs=drugs)
 
 
 if __name__ == "__main__":
